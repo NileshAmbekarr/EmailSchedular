@@ -1,3 +1,7 @@
+import dns from "dns";
+
+// MUST be first, before any DB / Supabase import
+dns.setDefaultResultOrder("ipv4first");
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { env } from './env.js';
