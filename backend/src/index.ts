@@ -4,6 +4,11 @@ import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
 import cookieParser from 'cookie-parser';
+import dns from "dns";
+
+// MUST be first, before any DB / Supabase import
+dns.setDefaultResultOrder("ipv4first");
+
 
 import { env } from './config/env.js';
 import authRoutes from './routes/auth.js';
