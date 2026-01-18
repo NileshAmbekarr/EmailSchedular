@@ -1,6 +1,6 @@
 import { Worker, Job } from 'bullmq';
 import { eq } from 'drizzle-orm';
-import { createRedisConnection } from '../config/redis.js';
+import { getRedisConnectionOptions } from '../config/redis.js';
 import { db } from '../config/database.js';
 import { emails } from '../db/schema.js';
 import { env } from '../config/env.js';
@@ -95,7 +95,7 @@ const processEmailJob = async (job: Job<EmailJobData>): Promise<void> => {
  */
 export const createEmailWorker = (): Worker<EmailJobData> => {
     const worker = new Worker<EmailJobData>('email-queue', processEmailJob, {
-        connection: createRedisConnection(),
+        connection: getRedisConnectionOptions(),
         concurrency: env.WORKER_CONCURRENCY,
         limiter: {
             max: 1,

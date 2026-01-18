@@ -1,12 +1,15 @@
-import Redis from 'ioredis';
 import { env } from './env.js';
+import Redis from 'ioredis';
 
-// Create Redis connection for BullMQ
-// Upstash requires TLS, which is handled by the 'rediss://' protocol
-export const redis = new Redis(env.UPSTASH_REDIS_URL, {
-    maxRetriesPerRequest: null, // Required for BullMQ
+// Redis connection options for Upstash
+const redisOptions = {
+    maxRetriesPerRequest: null as null, // Required for BullMQ
     enableReadyCheck: false,
-});
+    lazyConnect: false,
+};
+
+// Main Redis instance for general use (rate limiting, etc.)
+export const redis = new Redis(env.UPSTASH_REDIS_URL, redisOptions);
 
 redis.on('connect', () => {
     console.log('✅ Redis connected');
@@ -16,11 +19,19 @@ redis.on('error', (err) => {
     console.error('❌ Redis connection error:', err);
 });
 
-// Create a duplicate connection for BullMQ subscriber
-// BullMQ requires separate connections for pub/sub
-export const createRedisConnection = () => {
-    return new Redis(env.UPSTASH_REDIS_URL, {
-        maxRetriesPerRequest: null,
+// Get connection options for BullMQ
+// BullMQ works better with connection options object rather than Redis instance
+export const getRedisConnectionOptions = () => {
+    // Parse the URL to extract components
+    const url = new URL(env.UPSTASH_REDIS_URL);
+
+    return {
+        host: url.hostname,
+        port: parseInt(url.port) || 6379,
+        password: url.password || undefined,
+        username: url.username || 'default',
+        tls: url.protocol === 'rediss:' ? {} : undefined,
+        maxRetriesPerRequest: null as null,
         enableReadyCheck: false,
-    });
+    };
 };

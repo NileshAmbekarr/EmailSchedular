@@ -1,10 +1,9 @@
-import { eq, and, or, gte, lt, desc, asc } from 'drizzle-orm';
+import { eq, and, or, gte, desc, asc } from 'drizzle-orm';
 import { v4 as uuidv4 } from 'uuid';
 import { db } from '../config/database.js';
 import { emails, senders, type Email, type Sender } from '../db/schema.js';
 import { emailQueue } from '../queues/emailQueue.js';
 import { calculateScheduledTime } from './rateLimitService.js';
-import { env } from '../config/env.js';
 import type { ScheduleEmailRequest, EmailJobData } from '../types/index.js';
 
 /**
@@ -71,11 +70,12 @@ export const scheduleEmails = async (
         });
 
         // Update email with job ID
+        const jobId = job.id ?? null;
         await db.update(emails)
-            .set({ bullmqJobId: job.id, status: 'queued' })
+            .set({ bullmqJobId: jobId, status: 'queued' })
             .where(eq(emails.id, email.id));
 
-        email.bullmqJobId = job.id;
+        email.bullmqJobId = jobId;
         email.status = 'queued';
         scheduledEmails.push(email);
     }

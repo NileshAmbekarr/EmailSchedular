@@ -1,10 +1,13 @@
 import { Queue } from 'bullmq';
-import { createRedisConnection } from '../config/redis.js';
+import { getRedisConnectionOptions } from '../config/redis.js';
 import type { EmailJobData } from '../types/index.js';
 
-// Create the email queue
-export const emailQueue = new Queue<EmailJobData>('email-queue', {
-    connection: createRedisConnection(),
+// Define job names for type safety
+type EmailJobName = 'send-email';
+
+// Create the email queue with proper typing
+export const emailQueue = new Queue<EmailJobData, void, EmailJobName>('email-queue', {
+    connection: getRedisConnectionOptions(),
     defaultJobOptions: {
         attempts: 3,
         backoff: {
