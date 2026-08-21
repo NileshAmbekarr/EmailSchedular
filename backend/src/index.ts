@@ -1,73 +1,111 @@
 import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import helmet from 'helmet';
-import compression from 'compression';
-import cookieParser from 'cookie-parser';
-
-
-
+import type { Server } from 'node:http';
+import type { Worker } from 'bullmq';
+import { createApp } from './app.js';
 import { env } from './config/env.js';
-import authRoutes from './routes/auth.js';
-import emailRoutes from './routes/emails.js';
+import { logger } from './config/logger.js';
+import { closeDatabase } from './config/database.js';
+import { closeRedis } from './config/redis.js';
+import { closeQueues } from './queues/queues.js';
 import { createEmailWorker } from './queues/emailWorker.js';
-import { recoverOrphanedJobs } from './services/emailService.js';
+import { createCampaignWorker, startDueCampaignSweeper } from './queues/campaignWorker.js';
+import { recoverOrphanedJobs, startRecoverySweeper } from './services/recoveryService.js';
+import { closeAllProviders } from './providers/index.js';
+import { purgeExpiredIdempotencyKeys } from './middleware/idempotency.js';
 
-const app = express();
+const workers: Worker[] = [];
+const timers: NodeJS.Timeout[] = [];
+let server: Server | undefined;
+let shuttingDown = false;
 
-// Middleware
-app.use(helmet());
-app.use(compression());
-console.log("CORS origin:", env.FRONTEND_URL);
-app.use(cors({
-    origin: env.FRONTEND_URL,
-    credentials: true,
-}));
-app.use(express.json());
-app.use(cookieParser());
+const start = async (): Promise<void> => {
+    // Reconcile the database against the queue before accepting traffic, so a
+    // restart cannot leave scheduled mail stranded.
+    await recoverOrphanedJobs();
 
-// Health check
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// Routes
-app.use('/api/auth', authRoutes);
-app.use('/api/emails', emailRoutes);
-
-// Error handling
-app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
-    console.error('Unhandled error:', err);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-});
-
-// Start server
-const startServer = async () => {
-    try {
-        // Start the email worker
-        createEmailWorker();
-
-        // Recover any orphaned jobs from previous runs
-        await recoverOrphanedJobs();
-
-        app.listen(env.PORT, () => {
-            console.log(`
-🚀 Email Scheduler Backend running!
-   
-   Port: ${env.PORT}
-   Environment: ${env.NODE_ENV}
-   Frontend: ${env.FRONTEND_URL}
-   
-   Rate Limits:
-   - Max emails/hour/sender: ${env.MAX_EMAILS_PER_HOUR_PER_SENDER}
-   - Delay between emails: ${env.DELAY_BETWEEN_EMAILS_MS}ms
-   - Worker concurrency: ${env.WORKER_CONCURRENCY}
-`);
-        });
-    } catch (error) {
-        console.error('Failed to start server:', error);
-        process.exit(1);
+    /**
+     * Running the worker inside the API process is convenient for local
+     * development and small deployments, but it means scaling the API also
+     * multiplies the number of workers. Set RUN_WORKER_IN_API=false and run
+     * `npm run start:worker` as its own service to scale them independently.
+     */
+    if (env.RUN_WORKER_IN_API) {
+        workers.push(createEmailWorker(), createCampaignWorker());
+        timers.push(startDueCampaignSweeper(), startRecoverySweeper());
+        logger.info('workers running in-process');
     }
+
+    timers.push(
+        setInterval(
+            () => void purgeExpiredIdempotencyKeys().catch(() => {}),
+            60 * 60 * 1000
+        ).unref()
+    );
+
+    const app = createApp();
+
+    server = app.listen(env.PORT, () => {
+        logger.info(
+            {
+                port: env.PORT,
+                env: env.NODE_ENV,
+                provider: env.EMAIL_PROVIDER,
+                workersInProcess: env.RUN_WORKER_IN_API,
+                corsOrigins: env.CORS_ORIGINS,
+            },
+            'API listening'
+        );
+    });
 };
 
-startServer();
+/**
+ * Graceful shutdown.
+ *
+ * Render sends SIGTERM on every deploy. Without this, in-flight sends were
+ * killed mid-flight and left rows stuck in `processing` — which, combined with
+ * a recovery pass that ignored `processing`, meant a routine deploy could both
+ * drop and duplicate messages. Workers are closed first so they finish the job
+ * they hold before the connections go away.
+ */
+const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    logger.info({ signal }, 'shutting down');
+
+    // Stop accepting new HTTP connections.
+    if (server) {
+        await new Promise<void>((resolve) => server!.close(() => resolve()));
+    }
+
+    for (const timer of timers) clearInterval(timer);
+
+    // `close()` waits for active jobs to finish rather than killing them.
+    await Promise.allSettled(workers.map((worker) => worker.close()));
+
+    await closeAllProviders();
+    await closeQueues();
+    await closeRedis();
+    await closeDatabase();
+
+    logger.info('shutdown complete');
+    process.exit(0);
+};
+
+for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    process.on(signal, () => void shutdown(signal));
+}
+
+process.on('unhandledRejection', (reason) => {
+    logger.error({ reason }, 'unhandled promise rejection');
+});
+
+process.on('uncaughtException', (err) => {
+    logger.fatal({ err }, 'uncaught exception, shutting down');
+    void shutdown('uncaughtException');
+});
+
+start().catch((err) => {
+    logger.fatal({ err }, 'failed to start');
+    process.exit(1);
+});

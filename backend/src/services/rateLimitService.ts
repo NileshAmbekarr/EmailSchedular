@@ -1,131 +1,262 @@
 import { redis } from '../config/redis.js';
 import { env } from '../config/env.js';
-import type { RateLimitInfo } from '../types/index.js';
+import type { Sender } from '../db/schema.js';
 
 /**
- * Get the current hour window key (e.g., "2024-01-17-14" for 2-3 PM)
+ * Per-sender throughput control.
+ *
+ * The previous implementation did GET -> compare -> INCR as three round trips,
+ * so N concurrent workers could all read `limit - 1` and all proceed. Here the
+ * read, the comparison and both increments happen inside a single Lua script,
+ * which Redis executes atomically. That is what actually makes the limit hold
+ * across concurrent workers and multiple replicas.
+ *
+ * Windows are keyed in **UTC**. Deriving them from server local time meant two
+ * replicas in different regions disagreed about the current bucket, and DST
+ * shifts produced a doubled or missing hour.
  */
-const getHourWindow = (date: Date = new Date()): string => {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-    const hour = String(date.getHours()).padStart(2, '0');
-    return `${year}-${month}-${day}-${hour}`;
+
+export interface RateLimitDecision {
+    allowed: boolean;
+    /** Which cap was hit, when not allowed. */
+    limitedBy?: 'hour' | 'day';
+    hourCount: number;
+    dayCount: number;
+    hourLimit: number;
+    dayLimit: number;
+    /** When the blocking window rolls over. */
+    resetAt: Date;
+}
+
+export interface SenderLimits {
+    hourly: number;
+    daily: number;
+}
+
+const HOUR_TTL_SECONDS = 3600;
+const DAY_TTL_SECONDS = 86400;
+
+// ---------------------------------------------------------------------------
+// Window keys (UTC)
+// ---------------------------------------------------------------------------
+
+export const getHourWindow = (date: Date = new Date()): string =>
+    `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(
+        date.getUTCDate()
+    ).padStart(2, '0')}-${String(date.getUTCHours()).padStart(2, '0')}`;
+
+export const getDayWindow = (date: Date = new Date()): string =>
+    `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(
+        date.getUTCDate()
+    ).padStart(2, '0')}`;
+
+const hourKey = (senderId: string, window = getHourWindow()) =>
+    `ratelimit:h:${senderId}:${window}`;
+const dayKey = (senderId: string, window = getDayWindow()) => `ratelimit:d:${senderId}:${window}`;
+
+/** Start of the next UTC hour. */
+export const nextHourBoundary = (from: Date = new Date()): Date => {
+    const d = new Date(from);
+    d.setUTCMinutes(0, 0, 0);
+    d.setUTCHours(d.getUTCHours() + 1);
+    return d;
 };
 
-/**
- * Get the Redis key for a sender's rate limit counter
- */
-const getRateLimitKey = (senderId: string, hourWindow: string): string => {
-    return `ratelimit:${senderId}:${hourWindow}`;
+/** Start of the next UTC day. */
+export const nextDayBoundary = (from: Date = new Date()): Date => {
+    const d = new Date(from);
+    d.setUTCHours(0, 0, 0, 0);
+    d.setUTCDate(d.getUTCDate() + 1);
+    return d;
 };
 
+// ---------------------------------------------------------------------------
+// Warmup
+// ---------------------------------------------------------------------------
+
 /**
- * Check if a sender can send an email (under rate limit)
- * Returns remaining count and whether allowed
+ * A brand-new sending domain that suddenly emits thousands of messages is the
+ * fastest route to a blocklist. Warmup ramps the daily allowance over ~3 weeks.
  */
-export const checkRateLimit = async (senderId: string): Promise<RateLimitInfo> => {
-    const hourWindow = getHourWindow();
-    const key = getRateLimitKey(senderId, hourWindow);
-    const limit = env.MAX_EMAILS_PER_HOUR_PER_SENDER;
+const WARMUP_SCHEDULE = [
+    50, 100, 200, 350, 500, 750, 1000, 1500, 2000, 3000, 4000, 5000, 7500, 10000, 15000, 20000,
+    30000, 40000, 50000, 75000, 100000,
+];
 
-    const currentCount = await redis.get(key);
-    const count = currentCount ? parseInt(currentCount, 10) : 0;
+export const warmupLimitForDay = (dayIndex: number): number =>
+    WARMUP_SCHEDULE[Math.min(Math.max(dayIndex, 0), WARMUP_SCHEDULE.length - 1)];
 
-    // Calculate when the rate limit resets (next hour)
-    const now = new Date();
-    const resetAt = new Date(now);
-    resetAt.setHours(resetAt.getHours() + 1, 0, 0, 0);
+/**
+ * Effective caps for a sender: explicit overrides win, warmup clamps the daily
+ * figure, and the global env value is the fallback.
+ */
+export const resolveSenderLimits = (
+    sender: Pick<Sender, 'hourlyLimit' | 'dailyLimit' | 'warmupEnabled' | 'warmupStartedAt'>,
+    now: Date = new Date()
+): SenderLimits => {
+    const hourly = sender.hourlyLimit ?? env.MAX_EMAILS_PER_HOUR_PER_SENDER;
+    let daily = sender.dailyLimit ?? hourly * 24;
+
+    if (sender.warmupEnabled && sender.warmupStartedAt) {
+        const elapsedDays = Math.floor(
+            (now.getTime() - new Date(sender.warmupStartedAt).getTime()) / DAY_TTL_SECONDS / 1000
+        );
+        daily = Math.min(daily, warmupLimitForDay(elapsedDays));
+    }
+
+    return { hourly, daily };
+};
+
+// ---------------------------------------------------------------------------
+// Atomic reservation
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads both counters, compares them against their caps and increments both —
+ * atomically. Returns 1/0 plus the resulting counts.
+ *
+ * KEYS[1] hour counter, KEYS[2] day counter
+ * ARGV[1] hour limit, ARGV[2] day limit, ARGV[3] hour ttl, ARGV[4] day ttl
+ */
+const RESERVE_SCRIPT = `
+local hourCount = tonumber(redis.call('GET', KEYS[1]) or '0')
+local dayCount  = tonumber(redis.call('GET', KEYS[2]) or '0')
+local hourLimit = tonumber(ARGV[1])
+local dayLimit  = tonumber(ARGV[2])
+
+if hourCount >= hourLimit then
+  return {0, 'hour', hourCount, dayCount}
+end
+
+if dayLimit > 0 and dayCount >= dayLimit then
+  return {0, 'day', hourCount, dayCount}
+end
+
+hourCount = redis.call('INCR', KEYS[1])
+if hourCount == 1 then redis.call('EXPIRE', KEYS[1], ARGV[3]) end
+
+dayCount = redis.call('INCR', KEYS[2])
+if dayCount == 1 then redis.call('EXPIRE', KEYS[2], ARGV[4]) end
+
+return {1, '', hourCount, dayCount}
+`;
+
+type ReserveResult = [number, string, number, number];
+
+/**
+ * Attempts to consume one send slot for a sender.
+ *
+ * Call this immediately before handing the message to the provider — it is the
+ * authoritative check. Scheduling-time spreading is only an optimisation.
+ */
+export const reserveSlot = async (
+    senderId: string,
+    limits: SenderLimits,
+    now: Date = new Date()
+): Promise<RateLimitDecision> => {
+    const result = (await redis.eval(
+        RESERVE_SCRIPT,
+        2,
+        hourKey(senderId, getHourWindow(now)),
+        dayKey(senderId, getDayWindow(now)),
+        String(limits.hourly),
+        String(limits.daily),
+        String(HOUR_TTL_SECONDS),
+        String(DAY_TTL_SECONDS)
+    )) as ReserveResult;
+
+    const [allowed, limitedBy, hourCount, dayCount] = result;
 
     return {
-        senderId,
-        hourWindow,
-        count,
-        limit,
-        remaining: Math.max(0, limit - count),
-        resetAt,
+        allowed: allowed === 1,
+        limitedBy: allowed === 1 ? undefined : (limitedBy as 'hour' | 'day'),
+        hourCount,
+        dayCount,
+        hourLimit: limits.hourly,
+        dayLimit: limits.daily,
+        resetAt: limitedBy === 'day' ? nextDayBoundary(now) : nextHourBoundary(now),
     };
 };
 
 /**
- * Increment the rate limit counter for a sender
- * Returns the new count
+ * Returns a previously reserved slot. Used when a send fails in a way that will
+ * be retried — the attempt never reached the provider, so it should not count
+ * against the sender's quota.
  */
-export const incrementRateLimit = async (senderId: string): Promise<number> => {
-    const hourWindow = getHourWindow();
-    const key = getRateLimitKey(senderId, hourWindow);
+export const releaseSlot = async (senderId: string, now: Date = new Date()): Promise<void> => {
+    const h = hourKey(senderId, getHourWindow(now));
+    const d = dayKey(senderId, getDayWindow(now));
 
-    // Increment and set TTL to 1 hour (auto-cleanup)
-    const newCount = await redis.incr(key);
-
-    // Set TTL if this is the first increment
-    if (newCount === 1) {
-        await redis.expire(key, 3600); // 1 hour TTL
-    }
-
-    return newCount;
+    // Guard against dropping below zero if the window rolled over in between.
+    await redis
+        .multi()
+        .eval(`if tonumber(redis.call('GET', KEYS[1]) or '0') > 0 then return redis.call('DECR', KEYS[1]) end return 0`, 1, h)
+        .eval(`if tonumber(redis.call('GET', KEYS[1]) or '0') > 0 then return redis.call('DECR', KEYS[1]) end return 0`, 1, d)
+        .exec();
 };
 
-/**
- * Get the delay in milliseconds until the next available send slot
- * If under limit, returns 0
- * If at limit, returns delay until next hour window
- */
-export const getDelayUntilNextSlot = async (senderId: string): Promise<number> => {
-    const rateInfo = await checkRateLimit(senderId);
-
-    if (rateInfo.remaining > 0) {
-        return 0;
-    }
-
-    // Calculate delay until next hour
-    const now = new Date();
-    const delayMs = rateInfo.resetAt.getTime() - now.getTime();
-
-    return Math.max(0, delayMs);
-};
-
-/**
- * Calculate the scheduled time for an email considering rate limits
- * This is used when scheduling bulk emails to spread them out
- */
-export const calculateScheduledTime = async (
+/** Read-only view of the current counters, for the dashboard. */
+export const getRateLimitStatus = async (
     senderId: string,
-    baseScheduledTime: Date,
-    positionInBatch: number
-): Promise<Date> => {
-    const rateInfo = await checkRateLimit(senderId);
-    const delayBetweenEmails = env.DELAY_BETWEEN_EMAILS_MS;
-    const limit = env.MAX_EMAILS_PER_HOUR_PER_SENDER;
+    limits: SenderLimits,
+    now: Date = new Date()
+): Promise<RateLimitDecision> => {
+    const [hourRaw, dayRaw] = await redis.mget(
+        hourKey(senderId, getHourWindow(now)),
+        dayKey(senderId, getDayWindow(now))
+    );
 
-    // Calculate which hour window this email will be in
-    const emailsAlreadySent = rateInfo.count;
-    const emailPosition = emailsAlreadySent + positionInBatch;
+    const hourCount = Number(hourRaw ?? 0);
+    const dayCount = Number(dayRaw ?? 0);
+    const hourExhausted = hourCount >= limits.hourly;
+    const dayExhausted = limits.daily > 0 && dayCount >= limits.daily;
 
-    // If within limit for current hour
-    if (emailPosition < limit) {
-        const additionalDelay = positionInBatch * delayBetweenEmails;
-        return new Date(baseScheduledTime.getTime() + additionalDelay);
-    }
-
-    // Calculate how many hours to delay
-    const hoursToDelay = Math.floor(emailPosition / limit);
-    const positionInNewHour = emailPosition % limit;
-
-    const scheduledTime = new Date(baseScheduledTime);
-    scheduledTime.setHours(scheduledTime.getHours() + hoursToDelay);
-    scheduledTime.setMinutes(0, 0, 0); // Start of the hour
-
-    // Add position-based delay within that hour
-    const additionalDelay = positionInNewHour * delayBetweenEmails;
-    return new Date(scheduledTime.getTime() + additionalDelay);
+    return {
+        allowed: !hourExhausted && !dayExhausted,
+        limitedBy: hourExhausted ? 'hour' : dayExhausted ? 'day' : undefined,
+        hourCount,
+        dayCount,
+        hourLimit: limits.hourly,
+        dayLimit: limits.daily,
+        resetAt: dayExhausted ? nextDayBoundary(now) : nextHourBoundary(now),
+    };
 };
 
-/**
- * Reset rate limit for a sender (for testing purposes)
- */
 export const resetRateLimit = async (senderId: string): Promise<void> => {
-    const hourWindow = getHourWindow();
-    const key = getRateLimitKey(senderId, hourWindow);
-    await redis.del(key);
+    await redis.del(hourKey(senderId), dayKey(senderId));
+};
+
+// ---------------------------------------------------------------------------
+// Schedule spreading
+// ---------------------------------------------------------------------------
+
+/**
+ * Spreads a batch of `total` messages starting at `startAt`, honouring the
+ * inter-send delay and the hourly cap.
+ *
+ * This is pure arithmetic over the batch. The old version consulted the
+ * *current* hour's Redis counter to place messages destined for a future hour,
+ * which produced meaningless offsets, and did one Redis round trip per
+ * recipient.
+ */
+export const computeSendTimes = (
+    startAt: Date,
+    total: number,
+    opts: { delayMs: number; hourlyLimit: number }
+): Date[] => {
+    const { delayMs, hourlyLimit } = opts;
+    const base = startAt.getTime();
+    const times: Date[] = new Array(total);
+
+    // Messages beyond the hourly cap roll into subsequent hour windows.
+    for (let i = 0; i < total; i++) {
+        const hourOffset = hourlyLimit > 0 ? Math.floor(i / hourlyLimit) : 0;
+        const indexInHour = hourlyLimit > 0 ? i % hourlyLimit : i;
+
+        // Never let the intra-hour spread overflow into the next window.
+        const spread = Math.min(indexInHour * delayMs, HOUR_TTL_SECONDS * 1000 - 1000);
+        times[i] = new Date(base + hourOffset * HOUR_TTL_SECONDS * 1000 + spread);
+    }
+
+    return times;
 };

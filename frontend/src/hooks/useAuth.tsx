@@ -1,99 +1,96 @@
 'use client';
 
-import { createContext, useContext, useEffect, useState, ReactNode } from 'react';
-import { authApi } from '@/lib/api';
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useRouter } from 'next/navigation';
+import { authApi, setUnauthorizedHandler } from '@/lib/api';
 import type { User } from '@/types';
 
-interface AuthContextType {
+interface AuthContextValue {
     user: User | null;
     loading: boolean;
     login: (email: string, password: string) => Promise<void>;
-    register: (email: string, password: string, name: string) => Promise<void>;
+    register: (payload: {
+        email: string;
+        password: string;
+        name: string;
+        timezone?: string;
+    }) => Promise<void>;
     googleLogin: (credential: string) => Promise<void>;
     logout: () => Promise<void>;
+    refresh: () => Promise<void>;
+    setUser: (user: User) => void;
 }
 
-const AuthContext = createContext<AuthContextType | undefined>(undefined);
+const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
+/**
+ * Session state.
+ *
+ * The token lives only in an httpOnly cookie — there is no localStorage copy,
+ * so the current session is discovered by asking the API rather than by reading
+ * a token the page can see.
+ */
 export function AuthProvider({ children }: { children: ReactNode }) {
     const [user, setUser] = useState<User | null>(null);
     const [loading, setLoading] = useState(true);
+    const router = useRouter();
 
-    useEffect(() => {
-        checkAuth();
+    const refresh = useCallback(async () => {
+        try {
+            setUser(await authApi.me());
+        } catch {
+            setUser(null);
+        }
     }, []);
 
-    const checkAuth = async () => {
-        try {
-            const token = localStorage.getItem('token');
-            if (!token) {
-                setLoading(false);
-                return;
-            }
+    useEffect(() => {
+        void refresh().finally(() => setLoading(false));
+    }, [refresh]);
 
-            const response = await authApi.getMe();
-            if (response.success && response.data) {
-                setUser(response.data);
-            } else {
-                localStorage.removeItem('token');
-            }
-        } catch (error) {
-            localStorage.removeItem('token');
-        } finally {
-            setLoading(false);
-        }
-    };
+    // A 401 from any request means the cookie expired or was revoked.
+    useEffect(() => {
+        setUnauthorizedHandler(() => {
+            setUser(null);
+        });
+    }, []);
 
-    const login = async (email: string, password: string) => {
-        const response = await authApi.login(email, password);
-        if (response.success && response.data) {
-            localStorage.setItem('token', response.data.token);
-            setUser(response.data.user);
-        } else {
-            throw new Error(response.error || 'Login failed');
-        }
-    };
+    const login = useCallback(async (email: string, password: string) => {
+        const { user: next } = await authApi.login(email, password);
+        setUser(next);
+    }, []);
 
-    const register = async (email: string, password: string, name: string) => {
-        const response = await authApi.register(email, password, name);
-        if (response.success && response.data) {
-            localStorage.setItem('token', response.data.token);
-            setUser(response.data.user);
-        } else {
-            throw new Error(response.error || 'Registration failed');
-        }
-    };
+    const register = useCallback(
+        async (payload: { email: string; password: string; name: string; timezone?: string }) => {
+            const { user: next } = await authApi.register(payload);
+            setUser(next);
+        },
+        []
+    );
 
-    const googleLogin = async (credential: string) => {
-        const response = await authApi.googleLogin(credential);
-        if (response.success && response.data) {
-            localStorage.setItem('token', response.data.token);
-            setUser(response.data.user);
-        } else {
-            throw new Error(response.error || 'Google login failed');
-        }
-    };
+    const googleLogin = useCallback(async (credential: string) => {
+        const { user: next } = await authApi.googleLogin(credential);
+        setUser(next);
+    }, []);
 
-    const logout = async () => {
+    const logout = useCallback(async () => {
         try {
             await authApi.logout();
         } finally {
-            localStorage.removeItem('token');
             setUser(null);
+            router.push('/login');
         }
-    };
+    }, [router]);
 
-    return (
-        <AuthContext.Provider value={{ user, loading, login, register, googleLogin, logout }}>
-            {children}
-        </AuthContext.Provider>
+    const value = useMemo(
+        () => ({ user, loading, login, register, googleLogin, logout, refresh, setUser }),
+        [user, loading, login, register, googleLogin, logout, refresh]
     );
+
+    return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
-export function useAuth() {
+export function useAuth(): AuthContextValue {
     const context = useContext(AuthContext);
-    if (context === undefined) {
-        throw new Error('useAuth must be used within an AuthProvider');
-    }
+    if (!context) throw new Error('useAuth must be used inside an AuthProvider');
     return context;
 }

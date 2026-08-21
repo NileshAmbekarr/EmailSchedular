@@ -1,9 +1,10 @@
 'use client';
 
-import { AuthProvider } from '@/hooks/useAuth';
 import { Toaster } from 'react-hot-toast';
+import type { ReactNode } from 'react';
+import { AuthProvider } from '@/hooks/useAuth';
 
-export function Providers({ children }: { children: React.ReactNode }) {
+export function Providers({ children }: { children: ReactNode }) {
     return (
         <AuthProvider>
             {children}
@@ -12,23 +13,13 @@ export function Providers({ children }: { children: React.ReactNode }) {
                 toastOptions={{
                     duration: 4000,
                     style: {
-                        background: '#ffffff',
-                        color: '#212529',
-                        border: '1px solid #e9ecef',
-                        boxShadow: '0 4px 6px rgba(0, 0, 0, 0.07)',
+                        background: '#0b1220',
+                        color: '#f8fafc',
+                        fontSize: '13.5px',
+                        borderRadius: '9px',
                     },
-                    success: {
-                        iconTheme: {
-                            primary: '#22c55e',
-                            secondary: '#fff',
-                        },
-                    },
-                    error: {
-                        iconTheme: {
-                            primary: '#ef4444',
-                            secondary: '#fff',
-                        },
-                    },
+                    success: { iconTheme: { primary: '#22c55e', secondary: '#0b1220' } },
+                    error: { iconTheme: { primary: '#ef4444', secondary: '#0b1220' } },
                 }}
             />
         </AuthProvider>

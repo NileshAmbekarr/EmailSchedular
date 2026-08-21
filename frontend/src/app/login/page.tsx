@@ -1,217 +1,225 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { useRouter } from 'next/navigation';
-import { useAuth } from '@/hooks/useAuth';
-import { Button } from '@/components/ui/Button';
-import { Input } from '@/components/ui/Input';
+import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
+import Script from 'next/script';
+import { useRouter, useSearchParams } from 'next/navigation';
 import toast from 'react-hot-toast';
+import { useAuth } from '@/hooks/useAuth';
+import { ApiError } from '@/lib/api';
+import { Loading } from '@/components/ui';
 
-declare global {
-    interface Window {
-        google?: {
-            accounts: {
-                id: {
-                    initialize: (config: {
-                        client_id: string;
-                        callback: (response: { credential: string }) => void;
-                        auto_select?: boolean;
-                        cancel_on_tap_outside?: boolean;
-                        use_fedcm_for_prompt?: boolean;
-                        ux_mode?: string;
-                    }) => void;
-                    renderButton: (element: HTMLElement, config: {
-                        theme: string;
-                        size: string;
-                        width?: number;
-                        type?: string;
-                        text?: string;
-                    }) => void;
-                    prompt: (callback?: (notification: { isNotDisplayed: () => boolean; isSkippedMoment: () => boolean }) => void) => void;
-                    disableAutoSelect: () => void;
-                };
-                oauth2: {
-                    initCodeClient: (config: {
-                        client_id: string;
-                        scope: string;
-                        ux_mode: string;
-                        callback: (response: { code: string }) => void;
-                    }) => { requestCode: () => void };
-                    initTokenClient: (config: {
-                        client_id: string;
-                        scope: string;
-                        callback: (response: { access_token?: string; error?: string }) => void;
-                    }) => { requestAccessToken: () => void };
-                };
-            };
+const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
+
+/** Minimal surface of the Google Identity Services script. */
+interface GoogleIdentity {
+    accounts: {
+        id: {
+            initialize: (config: {
+                client_id: string;
+                callback: (response: { credential: string }) => void;
+            }) => void;
+            renderButton: (parent: HTMLElement, options: Record<string, unknown>) => void;
         };
-    }
+    };
 }
 
-export default function LoginPage() {
+function AuthForm() {
     const router = useRouter();
-    const { user, loading, login, register, googleLogin } = useAuth();
-    const [isRegistering, setIsRegistering] = useState(false);
+    const params = useSearchParams();
+    const { login, register, googleLogin, user, loading: authLoading } = useAuth();
+    const googleSlot = useRef<HTMLDivElement>(null);
+    const [googleReady, setGoogleReady] = useState(false);
+
+    const [mode, setMode] = useState<'login' | 'register'>(
+        params.get('mode') === 'register' ? 'register' : 'login'
+    );
+    const [name, setName] = useState('');
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
-    const [name, setName] = useState('');
     const [submitting, setSubmitting] = useState(false);
-    const [googleLoading, setGoogleLoading] = useState(false);
-    const googleButtonRef = useRef<HTMLDivElement>(null);
 
+    // Already signed in — skip straight through.
     useEffect(() => {
-        if (!loading && user) {
-            router.push('/dashboard/scheduled');
-        }
-    }, [user, loading, router]);
+        if (!authLoading && user) router.replace('/dashboard');
+    }, [authLoading, user, router]);
 
-    const handleGoogleCallback = useCallback(async (response: { credential: string }) => {
-        setGoogleLoading(true);
-        try {
-            await googleLogin(response.credential);
-            toast.success('Login successful!');
-            router.push('/dashboard/scheduled');
-        } catch (error) {
-            toast.error('Google login failed. Please try again.');
-            console.error('Google login error:', error);
-        } finally {
-            setGoogleLoading(false);
-        }
+    /**
+     * Renders Google's own button once its script has loaded. Skipped entirely
+     * when no client id is configured, so a deployment without Google OAuth
+     * shows email/password only rather than a button that cannot work.
+     */
+    const initGoogle = useCallback(() => {
+        const google = (window as unknown as { google?: GoogleIdentity }).google;
+        if (!google || !GOOGLE_CLIENT_ID || !googleSlot.current) return;
+
+        google.accounts.id.initialize({
+            client_id: GOOGLE_CLIENT_ID,
+            callback: async (response) => {
+                try {
+                    await googleLogin(response.credential);
+                    toast.success('Signed in with Google');
+                    router.push('/dashboard');
+                } catch (error) {
+                    toast.error(error instanceof ApiError ? error.message : 'Google sign-in failed');
+                }
+            },
+        });
+
+        google.accounts.id.renderButton(googleSlot.current, {
+            theme: 'outline',
+            size: 'large',
+            width: 356,
+            text: 'continue_with',
+        });
+
+        setGoogleReady(true);
     }, [googleLogin, router]);
 
-    useEffect(() => {
-        const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
-
-        if (!clientId) {
-            console.warn('Google Client ID not configured');
-            return;
-        }
-
-        // Load Google Identity Services
-        const script = document.createElement('script');
-        script.src = 'https://accounts.google.com/gsi/client';
-        script.async = true;
-        script.defer = true;
-        script.onload = () => {
-            if (window.google && googleButtonRef.current) {
-                try {
-                    window.google.accounts.id.initialize({
-                        client_id: clientId,
-                        callback: handleGoogleCallback,
-                        auto_select: false,
-                        cancel_on_tap_outside: true,
-                        use_fedcm_for_prompt: false, // Disable FedCM to avoid the error
-                        ux_mode: 'popup', // Use popup mode
-                    });
-
-                    // Render the Google Sign-In button
-                    window.google.accounts.id.renderButton(
-                        googleButtonRef.current,
-                        {
-                            theme: 'outline',
-                            size: 'large',
-                            type: 'standard',
-                            text: 'signin_with',
-                        }
-                    );
-                } catch (error) {
-                    console.error('Failed to initialize Google Sign-In:', error);
-                }
-            }
-        };
-        document.body.appendChild(script);
-
-        return () => {
-            if (script.parentNode) {
-                document.body.removeChild(script);
-            }
-        };
-    }, [handleGoogleCallback]);
-
-    const handleSubmit = async (e: React.FormEvent) => {
-        e.preventDefault();
+    const submit = async (event: React.FormEvent) => {
+        event.preventDefault();
         setSubmitting(true);
 
         try {
-            if (isRegistering) {
-                await register(email, password, name);
-                toast.success('Registration successful!');
+            if (mode === 'register') {
+                await register({
+                    email,
+                    password,
+                    name,
+                    // Sensible default so scheduled times display correctly
+                    // without the user having to find the setting first.
+                    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                });
+                toast.success('Account created — a sandbox sender is ready for you');
             } else {
                 await login(email, password);
-                toast.success('Login successful!');
+                toast.success('Welcome back');
             }
-            router.push('/dashboard/scheduled');
+            router.push('/dashboard');
         } catch (error) {
-            toast.error(error instanceof Error ? error.message : 'Authentication failed');
+            toast.error(error instanceof ApiError ? error.message : 'Something went wrong');
         } finally {
             setSubmitting(false);
         }
     };
 
-    if (loading) {
-        return (
-            <div className="login-page">
-                <div className="loading-spinner">Loading...</div>
-            </div>
-        );
-    }
-
     return (
-        <div className="login-page">
-            <div className="login-card">
-                <div className="login-header">
-                    <h1>{isRegistering ? 'Sign Up' : 'Login'}</h1>
-                </div>
+        <div className="auth-page">
+            <div className="auth-card">
+                <Link href="/" className="auth-brand">
+                    <span className="auth-mark">✦</span>
+                    Dispatch
+                </Link>
+                <p className="auth-sub">
+                    {mode === 'register'
+                        ? 'Create an account and start scheduling'
+                        : 'Sign in to your workspace'}
+                </p>
 
-                {/* Google Sign-In Button Container */}
-                <div className="google-btn-container">
-                    <div
-                        ref={googleButtonRef}
-                        className="google-btn-wrapper"
-                        style={{ opacity: googleLoading ? 0.6 : 1 }}
-                    />
-                </div>
+                <form onSubmit={submit}>
+                    {mode === 'register' && (
+                        <div className="field">
+                            <label className="label" htmlFor="name">Name</label>
+                            <input
+                                id="name"
+                                className="input"
+                                value={name}
+                                onChange={(event) => setName(event.target.value)}
+                                placeholder="Ada Lovelace"
+                                autoComplete="name"
+                                required
+                            />
+                        </div>
+                    )}
 
-                <div className="divider">
-                    <span>or {isRegistering ? 'sign up' : 'sign in'} with email</span>
-                </div>
-
-                <form onSubmit={handleSubmit} className="login-form">
-                    {isRegistering && (
-                        <Input
-                            type="text"
-                            value={name}
-                            onChange={(e) => setName(e.target.value)}
-                            placeholder="Full Name"
+                    <div className="field">
+                        <label className="label" htmlFor="email">Email</label>
+                        <input
+                            id="email"
+                            type="email"
+                            className="input"
+                            value={email}
+                            onChange={(event) => setEmail(event.target.value)}
+                            placeholder="you@company.com"
+                            autoComplete="email"
                             required
                         />
-                    )}
-                    <Input
-                        type="email"
-                        value={email}
-                        onChange={(e) => setEmail(e.target.value)}
-                        placeholder="Email ID"
-                        required
-                    />
-                    <Input
-                        type="password"
-                        value={password}
-                        onChange={(e) => setPassword(e.target.value)}
-                        placeholder="Password"
-                        required
-                    />
-                    <Button type="submit" loading={submitting} className="login-button">
-                        {isRegistering ? 'Sign Up' : 'Login'}
-                    </Button>
+                    </div>
+
+                    <div className="field">
+                        <label className="label" htmlFor="password">Password</label>
+                        <input
+                            id="password"
+                            type="password"
+                            className="input"
+                            value={password}
+                            onChange={(event) => setPassword(event.target.value)}
+                            placeholder={mode === 'register' ? 'At least 10 characters' : '••••••••'}
+                            autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
+                            required
+                        />
+                        {mode === 'register' && (
+                            <p className="hint">
+                                At least 10 characters, including a number or symbol.
+                            </p>
+                        )}
+                    </div>
+
+                    <button
+                        type="submit"
+                        className="btn btn-primary btn-block"
+                        disabled={submitting}
+                        style={{ marginTop: 4 }}
+                    >
+                        {submitting ? (
+                            <>
+                                <span className="spinner" style={{ borderTopColor: '#fff' }} />
+                                Please wait…
+                            </>
+                        ) : mode === 'register' ? (
+                            'Create account'
+                        ) : (
+                            'Sign in'
+                        )}
+                    </button>
                 </form>
 
-                <p className="login-toggle">
-                    {isRegistering ? 'Already have an account?' : "Don't have an account?"}{' '}
-                    <button type="button" onClick={() => setIsRegistering(!isRegistering)}>
-                        {isRegistering ? 'Login' : 'Sign up'}
+                {GOOGLE_CLIENT_ID && (
+                    <>
+                        <div className="auth-divider" style={{ opacity: googleReady ? 1 : 0 }}>
+                            or
+                        </div>
+                        <div
+                            ref={googleSlot}
+                            style={{ display: 'flex', justifyContent: 'center' }}
+                        />
+                        <Script
+                            src="https://accounts.google.com/gsi/client"
+                            strategy="afterInteractive"
+                            onLoad={initGoogle}
+                        />
+                    </>
+                )}
+
+                <p className="auth-switch">
+                    {mode === 'register' ? 'Already have an account?' : 'New here?'}{' '}
+                    <button
+                        type="button"
+                        onClick={() => setMode(mode === 'register' ? 'login' : 'register')}
+                    >
+                        {mode === 'register' ? 'Sign in' : 'Create an account'}
                     </button>
                 </p>
             </div>
         </div>
+    );
+}
+
+export default function LoginPage() {
+    // useSearchParams requires a Suspense boundary in the App Router.
+    return (
+        <Suspense fallback={<Loading />}>
+            <AuthForm />
+        </Suspense>
     );
 }

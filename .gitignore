@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.next/
+out/
+
+# Environment
+# Broad on purpose: .env.backup, .env.old and similar strays carry real
+# credentials and are exactly what gets committed by accident.
+.env*
+!.env.example
+
+# Editors
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test output
+coverage/
+
+# OS
+.DS_Store
+Thumbs.db

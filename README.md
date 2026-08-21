@@ -1,319 +1,229 @@
-# 📧 Email Scheduler - Full-Stack Application
+# Dispatch — Email Scheduling Platform
 
-A production-grade email scheduler service with dashboard, built for the ReachInbox hiring assignment.
+Queue-backed bulk email scheduling with per-sender rate limiting, exactly-once
+delivery, restart recovery, and the deliverability machinery a real sender needs:
+unsubscribe handling, suppression lists, bounce/complaint webhooks and domain
+authentication.
 
-## 🚀 Features
-
-### Backend
-- ✅ **BullMQ + Redis** for reliable job scheduling (no cron!)
-- ✅ **PostgreSQL + Drizzle ORM** for persistent storage
-- ✅ **Per-sender rate limiting** with Redis counters
-- ✅ **Configurable concurrency** and delay between emails
-- ✅ **Restart persistence** - jobs survive server restarts
-- ✅ **Idempotency** - no duplicate emails sent
-- ✅ **Ethereal SMTP** for testing email sends
-
-### Frontend
-- ✅ **Google OAuth** authentication
-- ✅ **Email/Password** authentication
-- ✅ **Dashboard** with Scheduled/Sent tabs
-- ✅ **Compose Modal** with CSV upload
-- ✅ **Premium dark theme** UI
-- ✅ **Loading & empty states**
-- ✅ **Toast notifications**
+| | |
+|---|---|
+| **API + worker** | Express, TypeScript (ESM), BullMQ, Drizzle ORM |
+| **Dashboard** | Next.js 16 (App Router), React 19 |
+| **Data** | PostgreSQL (source of truth), Redis (scheduling index + counters) |
+| **Sending** | Resend · Amazon SES · your own SMTP · Ethereal (dev sandbox) |
 
 ---
 
-## 🛠️ Tech Stack
+## Quick start
 
-| Component | Technology |
-|-----------|------------|
-| Backend | Express.js, TypeScript |
-| Database | PostgreSQL, Drizzle ORM |
-| Queue | BullMQ, Redis (Upstash) |
-| SMTP | Nodemailer, Ethereal Email |
-| Frontend | Next.js 14, TypeScript |
-| Styling | CSS (ready for Tailwind) |
-| Auth | Google OAuth, JWT |
-
----
-
-## 📋 Prerequisites
-
-- Node.js 18+
-- npm or yarn
-- PostgreSQL database (local or cloud like Neon/Supabase)
-- Redis (Upstash recommended for cloud)
-- Google Cloud Console project (for OAuth)
-
----
-
-## ⚙️ Environment Setup
-
-### 1. Backend Environment
-
-Create `backend/.env`:
-
-```env
-# Database (PostgreSQL)
-DATABASE_URL=postgresql://user:password@host:5432/email_scheduler
-
-# Redis (Upstash)
-UPSTASH_REDIS_URL=rediss://default:xxxxx@xxxxx.upstash.io:6379
-
-# JWT Secret (min 32 chars)
-JWT_SECRET=your-super-secret-jwt-key-change-in-production
-
-# Google OAuth
-GOOGLE_CLIENT_ID=your-google-client-id.apps.googleusercontent.com
-GOOGLE_CLIENT_SECRET=your-google-client-secret
-
-# Rate Limiting
-MAX_EMAILS_PER_HOUR_PER_SENDER=200
-DELAY_BETWEEN_EMAILS_MS=2000
-WORKER_CONCURRENCY=5
-
-# Ethereal (leave empty to auto-generate)
-SMTP_HOST=smtp.ethereal.email
-SMTP_PORT=587
-SMTP_USER=
-SMTP_PASS=
-
-# Server
-PORT=3001
-NODE_ENV=development
-FRONTEND_URL=http://localhost:3000
-```
-
-### 2. Frontend Environment
-
-Create `frontend/.env.local`:
-
-```env
-NEXT_PUBLIC_API_URL=http://localhost:3001
-NEXT_PUBLIC_GOOGLE_CLIENT_ID=your-google-client-id.apps.googleusercontent.com
-```
-
-### 3. Upstash Redis Setup
-
-1. Go to [upstash.com](https://upstash.com)
-2. Create a free account
-3. Create a new Redis database
-4. Copy the connection URL (starts with `rediss://`)
-
-### 4. Google OAuth Setup
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com)
-2. Create a new project
-3. Enable "Google+ API"
-4. Go to Credentials → Create OAuth 2.0 Client ID
-5. Add authorized origins: `http://localhost:3000`
-6. Add authorized redirect URIs: `http://localhost:3000`
-7. Copy Client ID and Client Secret
-
----
-
-## 🚀 Running the Application
-
-### Backend
+### Docker (everything at once)
 
 ```bash
-cd backend
+docker compose up --build
+```
 
-# Install dependencies
-npm install
+Postgres, Redis, the API (`:3001`) and a separate worker. Migrations run before
+the API accepts traffic. Then start the dashboard:
 
-# Push database schema
-npm run db:push
+```bash
+cd frontend && npm install && npm run dev
+```
 
-# Start development server
+### Local
+
+```bash
+cd backend && npm install && cp .env.example .env
+```
+
+Fill in `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET` and `ENCRYPTION_KEY`, then:
+
+```bash
+npm run db:migrate && npm run dev
+```
+
+Generate the two secrets with:
+
+```bash
+openssl rand -hex 32
+```
+
+---
+
+## Using it
+
+There's an interactive guide at **`/dashboard/guide`** — a live checklist that reads
+your account state and shows which steps you've actually completed, plus concept
+explanations and troubleshooting. It's the first thing to open on a new account.
+
+The short version:
+
+1. **You already have a sender.** Every account gets a sandbox sender backed by
+   Ethereal, which *captures* mail and returns a preview link instead of
+   delivering it. Run the full pipeline today without owning a domain.
+2. **Set your company name and postal address** (Settings → Profile). They go in
+   the footer of every campaign, and a postal address is legally required in
+   commercial email.
+3. **Compose → Send test.** Delivers to one address immediately, bypassing the
+   campaign pipeline — no rows, no analytics.
+4. **Schedule a campaign.** Paste addresses, upload a CSV, or pick a saved
+   audience. Any column named `email` is the address; every other column becomes
+   a merge tag, so `email,first_name,company` lets you write
+   `{{first_name|there}}` — the part after `|` is the fallback.
+5. **Verify a domain before real mail.** Settings → Domains generates a DKIM
+   keypair and shows four DNS records to publish. The sandbox sender never
+   delivers to real inboxes.
+
+Five nouns worth knowing: a **sender** is the from-address and the unit
+throttling applies to; a **domain** proves you own it; an **audience** is a saved
+contact list; a **template** is reusable content; a **campaign** is one send that
+owns its recipients, schedule and stats. Pause, cancel and reschedule all operate
+at the campaign level.
+
+## Architecture
+
+```
+Dashboard ──► API ──┬──► Postgres   source of truth: campaigns, messages, events
+                    └──► Redis      delayed jobs + rate-limit counters
+                             │
+                             ▼
+                          Worker ──► claim ─► suppression ─► rate limit ─► provider
+                             ▲                                                │
+                             └──────────── webhooks ──────────────────────────┘
+```
+
+**Postgres decides, Redis schedules.** BullMQ moves a message to a worker at the
+right moment, but the database row is what says whether it may send. Losing Redis
+costs timing, never mail — the recovery pass rebuilds the queue from the database.
+
+### The three guarantees
+
+**Nothing sends twice.** The job id is always the message's uuid, and the worker
+claims the row with a conditional update (`WHERE status IN (pending, queued,
+retrying)`). A duplicated or recovered job loses that race and exits without
+sending. Rate-limited jobs are deferred with `moveToDelayed`, which preserves the
+job id rather than minting a new one.
+
+**Nothing gets dropped.** On boot and every five minutes, `recoverOrphanedJobs()`
+reclaims rows stuck in `processing` past the visibility timeout, re-enqueues
+anything queued without a live job, and handles messages whose slot passed during
+an outage — sending them late, or expiring them past `MAX_RECOVERY_LATENESS_MS`
+rather than delivering something stale.
+
+**Limits actually hold.** Read, compare and increment happen inside a single Lua
+script, so concurrent workers cannot all observe the last free slot. Windows are
+keyed in UTC, so replicas never disagree about the current hour and DST cannot
+double or skip one.
+
+---
+
+## Deliverability
+
+On by default, because none of it is optional in practice:
+
+- **One-click unsubscribe** — `List-Unsubscribe` + `List-Unsubscribe-Post`
+  headers and a visible footer link, signed per recipient.
+- **Suppression list** — unsubscribes, hard bounces and complaints, checked
+  immediately before every send (not at schedule time, since a campaign queued on
+  Monday may still be sending on Wednesday).
+- **Domain authentication** — generated DKIM keypair, SPF and DMARC records, live
+  DNS verification. A sender cannot use a domain until it passes.
+- **Reputation guards** — campaigns auto-pause above `MAX_COMPLAINT_RATE` (0.1%)
+  or `MAX_BOUNCE_RATE` (5%).
+- **Warmup** — a three-week daily ramp for new domains.
+- **Content linting** — advisory spam-trigger, subject-length and image-ratio
+  checks in the composer.
+
+---
+
+## API
+
+Auth is a session cookie or `X-API-Key`. Mutating endpoints accept
+`Idempotency-Key`.
+
+| Method | Path | |
+|---|---|---|
+| POST | `/api/auth/register` · `/login` · `/google` | |
+| GET/PATCH | `/api/auth/me` | profile |
+| POST | `/api/auth/logout` · `/logout-all` | `logout-all` revokes every issued token |
+| POST | `/api/campaigns` | create + schedule |
+| GET | `/api/campaigns` · `/campaigns/:id` | paginated |
+| POST | `/api/campaigns/:id/cancel` · `/pause` · `/resume` | |
+| PATCH | `/api/campaigns/:id/schedule` | reschedule |
+| GET | `/api/emails` · `/emails/:id` | filter by `bucket`, `campaignId` |
+| POST | `/api/emails/:id/cancel` | |
+| POST | `/api/preview` · `/api/test-send` | composer |
+| GET | `/api/stats` · `/api/queue` | analytics, queue depth |
+| CRUD | `/api/senders` · `/templates` · `/lists` · `/suppressions` · `/domains` · `/api-keys` | |
+| GET/POST | `/api/public/unsubscribe/:token` | signed, no session |
+| GET | `/api/public/open/:token` · `/click/:token` | tracking |
+| POST | `/api/webhooks/resend` · `/ses` | signature-verified |
+| GET | `/health` · `/ready` | `/ready` probes Postgres and Redis |
+
+Example:
+
+```bash
+curl -X POST $API/api/campaigns -H "Content-Type: application/json" -H "X-API-Key: esk_live_..." -H "Idempotency-Key: 9f2c" -d '{"name":"March launch","senderId":"...","subject":"Hi {{first_name|there}}","body":"<p>Hello</p>","scheduledAt":"2026-08-01T09:00:00Z","timezone":"Asia/Kolkata","listId":"..."}'
+```
+
+---
+
+## Scaling
+
+Run the worker as its own service so sending and serving scale apart — otherwise
+adding an API replica silently multiplies your send rate:
+
+```bash
+RUN_WORKER_IN_API=false npm start
+```
+
+```bash
+npm run start:worker
+```
+
+Large campaigns are expanded by a paged fan-out job (`FANOUT_BATCH_SIZE`), so
+scheduling 100k recipients returns immediately instead of holding a request open
+for 300k round trips.
+
+---
+
+## Development
+
+```bash
 npm run dev
 ```
 
-The backend will start on `http://localhost:3001`
+| Script | |
+|---|---|
+| `npm run dev` | API with an in-process worker |
+| `npm run dev:worker` | worker only |
+| `npm test` | 70 unit tests |
+| `npm run typecheck` | |
+| `npm run db:generate` | after changing `src/db/schema.ts` |
+| `npm run db:migrate` | apply committed migrations |
 
-### Frontend
-
-```bash
-cd frontend
-
-# Install dependencies  
-npm install
-
-# Start development server
-npm run dev
-```
-
-The frontend will start on `http://localhost:3000`
+Migrations live in `backend/drizzle/` and are committed. CI fails if the schema
+changes without one. Do not use `db:push` against a database with real data.
 
 ---
 
-## 📊 Architecture
+## Deployment notes
 
-### Scheduling Flow
-
-```
-┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-│   Frontend   │ ──▶  │  Express API │ ──▶  │  PostgreSQL  │
-│  (Next.js)   │      │   /schedule  │      │  (emails)    │
-└──────────────┘      └──────┬───────┘      └──────────────┘
-                             │
-                             ▼
-                      ┌──────────────┐
-                      │    BullMQ    │
-                      │  (delayed    │
-                      │    jobs)     │
-                      └──────┬───────┘
-                             │
-                             ▼
-                      ┌──────────────┐
-                      │   Redis      │
-                      │  (Upstash)   │
-                      └──────┬───────┘
-                             │
-                             ▼
-                      ┌──────────────┐
-                      │   Worker     │
-                      │ (processes   │
-                      │  at time)    │
-                      └──────┬───────┘
-                             │
-                             ▼
-                      ┌──────────────┐
-                      │  Ethereal    │
-                      │   SMTP       │
-                      └──────────────┘
-```
-
-### How Persistence Works
-
-1. When emails are scheduled, they're stored in **PostgreSQL** with `status: 'queued'`
-2. Corresponding **BullMQ jobs** are created with the correct delay
-3. On server restart:
-   - `recoverOrphanedJobs()` runs automatically
-   - Queries all pending/queued emails from DB
-   - Checks if BullMQ job exists for each
-   - Recreates missing jobs with correct delay
-
-### How Rate Limiting Works
-
-1. Each sender has a **Redis counter** keyed by `ratelimit:{senderId}:{hourWindow}`
-2. Before processing, worker checks if count < limit
-3. If under limit: increment counter, process email
-4. If at limit: reschedule job to next hour window
-5. Counters auto-expire after 1 hour (Redis TTL)
-
-**Configuration:**
-- `MAX_EMAILS_PER_HOUR_PER_SENDER=200` - emails per sender per hour
-- `DELAY_BETWEEN_EMAILS_MS=2000` - minimum 2 seconds between sends
-- `WORKER_CONCURRENCY=5` - process up to 5 jobs concurrently
+- **Migrating an existing v1 database.** The v2 schema is a rewrite — campaigns,
+  events, suppressions, domains and encrypted credentials are all new, and the
+  `emails` table changed shape. `drizzle/0000_*.sql` assumes an empty database.
+  For a dev database, drop the old tables and run `npm run db:migrate`. For one
+  with data worth keeping, write a data migration first.
+- **`API_URL` must be publicly reachable.** Unsubscribe and tracking links are
+  built from it and opened from recipients' mail clients.
+- **Cross-site cookies.** In production the session cookie is
+  `SameSite=None; Secure`, which is what makes a Vercel dashboard work against a
+  Render API. Both ends must be HTTPS.
+- **Webhook secrets.** `RESEND_WEBHOOK_SECRET` is required — unsigned webhooks
+  are rejected, since forged events could suppress an entire list.
 
 ---
 
-## 📁 Project Structure
+## Documentation
 
-```
-EmailSchedular/
-├── backend/
-│   ├── src/
-│   │   ├── config/         # Environment, DB, Redis
-│   │   ├── controllers/    # Route handlers
-│   │   ├── db/             # Drizzle schema
-│   │   ├── middleware/     # Auth middleware
-│   │   ├── queues/         # BullMQ queue & worker
-│   │   ├── routes/         # API routes
-│   │   ├── services/       # Business logic
-│   │   ├── types/          # TypeScript types
-│   │   └── index.ts        # Entry point
-│   ├── drizzle.config.ts
-│   └── package.json
-│
-├── frontend/
-│   ├── src/
-│   │   ├── app/            # Next.js pages
-│   │   ├── components/     # React components
-│   │   ├── hooks/          # Custom hooks
-│   │   ├── lib/            # API client
-│   │   └── types/          # TypeScript types
-│   └── package.json
-│
-└── README.md
-```
-
----
-
-## 🧪 API Endpoints
-
-### Auth
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/auth/google` | Google OAuth login |
-| POST | `/api/auth/register` | Email/password register |
-| POST | `/api/auth/login` | Email/password login |
-| GET | `/api/auth/me` | Get current user |
-| POST | `/api/auth/logout` | Logout |
-
-### Emails (Protected)
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/emails/schedule` | Schedule emails |
-| GET | `/api/emails/scheduled` | Get scheduled emails |
-| GET | `/api/emails/sent` | Get sent emails |
-| GET | `/api/emails/senders` | Get user's senders |
-| POST | `/api/emails/senders` | Create new sender |
-| GET | `/api/emails/rate-limit/:senderId` | Get rate limit info |
-
----
-
-## ✅ Features Checklist
-
-### Backend
-- [x] Email scheduling via BullMQ delayed jobs
-- [x] PostgreSQL persistence with Drizzle ORM
-- [x] Per-sender rate limiting (configurable)
-- [x] Delay between emails (configurable)
-- [x] Worker concurrency (configurable)
-- [x] Restart recovery (orphaned job detection)
-- [x] Idempotency (unique job IDs)
-- [x] Google OAuth + Email/Password auth
-- [x] Ethereal SMTP integration
-
-### Frontend
-- [x] Google OAuth login
-- [x] Email/Password login
-- [x] Dashboard with user info
-- [x] Scheduled emails table
-- [x] Sent emails table
-- [x] Compose modal with CSV upload
-- [x] Loading states
-- [x] Empty states
-- [x] Error handling with toasts
-- [x] Premium dark theme
-
----
-
-## 🔄 Testing Restart Persistence
-
-1. Schedule some emails for 5+ minutes in the future
-2. Stop the backend server (`Ctrl+C`)
-3. Start the backend again (`npm run dev`)
-4. Watch the console for "Recovery complete" message
-5. Verify emails still send at the correct time
-
----
-
-## 📝 Notes & Trade-offs
-
-1. **Ethereal Email**: Auto-generates test SMTP accounts. Emails are captured (not really sent) and can be viewed via preview URLs.
-
-2. **Rate Limiting**: Using Redis INCR with TTL for atomic counters. Safe across multiple workers.
-
-3. **Job Rescheduling**: When rate limit is hit, jobs are rescheduled to the next hour window rather than being dropped.
-
-4. **Sender Accounts**: Each user gets a default sender with Ethereal credentials on registration.
-
----
-
-## 👤 Author
-
-Built for the ReachInbox Full-Stack Developer hiring assignment.
+- [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) — architecture, data model, conventions
+- [ASSESSMENT.md](ASSESSMENT.md) — the review this rewrite came from
