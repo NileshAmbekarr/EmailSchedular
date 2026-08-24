@@ -1,0 +1,132 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Apply with: Render Dashboard -> New -> Blueprint -> pick this repo.
+#
+# FREE-TIER LAYOUT (this file)
+# ---------------------------
+# Render's Background Workers are paid-only, so this runs the queue workers
+# inside the API process (RUN_WORKER_IN_API=true) as a single free web service.
+#
+# The trade-off worth understanding: free web services SPIN DOWN after ~15
+# minutes without an inbound request, and a sleeping service processes no jobs.
+# An email scheduled for 03:00 will not send at 03:00 if nothing woke the
+# service. Two things make that survivable:
+#
+#   1. recoverOrphanedJobs() runs on boot, so anything whose slot passed while
+#      the service slept is re-enqueued and sent late rather than lost (up to
+#      MAX_RECOVERY_LATENESS_MS, default 24h).
+#   2. .github/workflows/keepalive.yml pings /health every 10 minutes, which
+#      keeps the service awake. Free tier allows 750 instance-hours/month and a
+#      month is ~730 hours, so one always-on service fits.
+#
+# For real scheduling accuracy, upgrade to a paid instance and split the worker
+# out — see the commented block at the bottom.
+
+services:
+  - type: web
+    name: dispatch-api
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: node dist/index.js
+
+    # Applied before the new version receives traffic.
+    preDeployCommand: node dist/db/migrate.js
+
+    healthCheckPath: /ready
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      # Workers run in-process on the free plan.
+      - key: RUN_WORKER_IN_API
+        value: "true"
+      # Modest, because the API and the workers share one free instance.
+      - key: WORKER_CONCURRENCY
+        value: "3"
+
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ENCRYPTION_KEY
+        generateValue: true
+      - key: LINK_SECRET
+        generateValue: true
+
+      # Account-specific — set these in the dashboard.
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: API_URL
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: EMAIL_PROVIDER
+        value: ethereal
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_WEBHOOK_SECRET
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+
+# ---------------------------------------------------------------------------
+# PAID LAYOUT — separate worker
+#
+# Sending and serving have different scaling curves, and running them together
+# means adding an API replica also multiplies the send rate. Once you are on a
+# paid plan:
+#
+#   1. Set RUN_WORKER_IN_API=false on dispatch-api above.
+#   2. Uncomment the service below.
+#
+# ENCRYPTION_KEY must match the API exactly — the worker decrypts stored SMTP
+# credentials with it, and a mismatch fails every send. `fromService` copies it
+# rather than generating a second one.
+#
+#  - type: worker            # or `type: web` with WORKER_PORT set to $PORT,
+#    name: dispatch-worker   # if you would rather stay on web-service pricing
+#    runtime: docker
+#    plan: starter
+#    region: singapore
+#    dockerfilePath: ./backend/Dockerfile
+#    dockerContext: ./backend
+#    dockerCommand: node dist/worker.js
+#    envVars:
+#      - key: NODE_ENV
+#        value: production
+#      - key: WORKER_CONCURRENCY
+#        value: "5"
+#      - fromService:
+#          type: web
+#          name: dispatch-api
+#          envVarKey: JWT_SECRET
+#        key: JWT_SECRET
+#      - fromService:
+#          type: web
+#          name: dispatch-api
+#          envVarKey: ENCRYPTION_KEY
+#        key: ENCRYPTION_KEY
+#      - fromService:
+#          type: web
+#          name: dispatch-api
+#          envVarKey: LINK_SECRET
+#        key: LINK_SECRET
+#      - key: DATABASE_URL
+#        sync: false
+#      - key: REDIS_URL
+#        sync: false
+#      - key: API_URL
+#        sync: false
+#      - key: FRONTEND_URL
+#        sync: false
+#      - key: EMAIL_PROVIDER
+#        value: ethereal
+#      - key: RESEND_API_KEY
+#        sync: false
+#      - key: RESEND_WEBHOOK_SECRET
+#        sync: false

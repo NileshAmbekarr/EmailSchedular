@@ -1,0 +1,16 @@
+# Keeps secrets out of the build context and the image small/fast to build.
+.env*
+!.env.example
+
+node_modules
+dist
+coverage
+
+tests
+vitest.config.ts
+
+.git
+.gitignore
+Dockerfile
+.dockerignore
+*.log

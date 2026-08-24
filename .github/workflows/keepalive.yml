@@ -1,0 +1,41 @@
+# Keeps a Render free web service awake.
+#
+# Free instances spin down after ~15 minutes without an inbound request, and a
+# sleeping instance runs no queue workers — a campaign scheduled for 03:00 would
+# not send until something woke the service. A ping every 10 minutes keeps it up.
+#
+# Set the REPO VARIABLE `API_URL` (Settings -> Secrets and variables -> Actions
+# -> Variables) to your Render URL, e.g. https://dispatch-api.onrender.com
+# Without it the job no-ops rather than failing.
+
+name: Keep API awake
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub queues scheduled runs under load, so treat this
+    # as "roughly every 10-15 minutes" rather than a guarantee.
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        env:
+          API_URL: ${{ vars.API_URL }}
+        run: |
+          if [ -z "$API_URL" ]; then
+            echo "API_URL repo variable is not set — skipping."
+            exit 0
+          fi
+
+          # A cold start can take ~50s on the free plan, hence the long timeout.
+          # --fail-with-body surfaces the response when the status is non-2xx.
+          code=$(curl -sS -o /tmp/body -w '%{http_code}' --max-time 90 "$API_URL/health" || echo "000")
+          echo "GET $API_URL/health -> $code"
+          cat /tmp/body || true
+
+          if [ "$code" != "200" ]; then
+            echo "::warning::Health check returned $code"
+          fi

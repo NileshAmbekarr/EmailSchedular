@@ -11,16 +11,30 @@ const csv = z
             .filter(Boolean)
     );
 
+/**
+ * `KEY=` in a .env file yields an empty string, not an absent value — and
+ * `Number('')` is 0, which then fails `.positive()` and kills the process at
+ * boot. Treat empty as "not set" so a blank line falls back to the default.
+ */
+const blankAsUndefined = (value: unknown) =>
+    typeof value === 'string' && value.trim() === '' ? undefined : value;
+
 const numeric = (fallback: number) =>
-    z.coerce.number().int().positive().default(fallback);
+    z.preprocess(blankAsUndefined, z.coerce.number().int().positive().default(fallback));
+
+const optionalNumeric = () =>
+    z.preprocess(blankAsUndefined, z.coerce.number().int().positive().optional());
+
+const optionalString = () =>
+    z.preprocess(blankAsUndefined, z.string().optional());
 
 const envSchema = z
     .object({
         // ---- Core infrastructure -------------------------------------------------
         DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
         /** Standard redis:// or rediss:// URL — NOT the Upstash REST URL. */
-        REDIS_URL: z.string().min(1).optional(),
-        UPSTASH_REDIS_URL: z.string().min(1).optional(),
+        REDIS_URL: z.preprocess(blankAsUndefined, z.string().min(1).optional()),
+        UPSTASH_REDIS_URL: z.preprocess(blankAsUndefined, z.string().min(1).optional()),
 
         // ---- Auth ----------------------------------------------------------------
         JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
@@ -40,7 +54,7 @@ const envSchema = z
             .min(32, 'ENCRYPTION_KEY must be at least 32 characters (use `openssl rand -hex 32`)'),
 
         /** Separate secret for unsubscribe/tracking link HMACs. */
-        LINK_SECRET: z.string().min(16).optional(),
+        LINK_SECRET: z.preprocess(blankAsUndefined, z.string().min(16).optional()),
 
         // ---- Sending -------------------------------------------------------------
         EMAIL_PROVIDER: z.enum(['ethereal', 'smtp', 'resend', 'ses']).default('ethereal'),
@@ -51,16 +65,16 @@ const envSchema = z
             .enum(['true', 'false'])
             .default('false')
             .transform((v) => v === 'true'),
-        SMTP_USER: z.string().optional(),
-        SMTP_PASS: z.string().optional(),
+        SMTP_USER: optionalString(),
+        SMTP_PASS: optionalString(),
 
-        RESEND_API_KEY: z.string().optional(),
-        RESEND_WEBHOOK_SECRET: z.string().optional(),
+        RESEND_API_KEY: optionalString(),
+        RESEND_WEBHOOK_SECRET: optionalString(),
 
         AWS_REGION: z.string().default('us-east-1'),
-        AWS_ACCESS_KEY_ID: z.string().optional(),
-        AWS_SECRET_ACCESS_KEY: z.string().optional(),
-        SES_CONFIGURATION_SET: z.string().optional(),
+        AWS_ACCESS_KEY_ID: optionalString(),
+        AWS_SECRET_ACCESS_KEY: optionalString(),
+        SES_CONFIGURATION_SET: optionalString(),
 
         // ---- Throttling ----------------------------------------------------------
         MAX_EMAILS_PER_HOUR_PER_SENDER: numeric(200),
@@ -86,6 +100,13 @@ const envSchema = z
 
         // ---- Server --------------------------------------------------------------
         PORT: numeric(3001),
+        /**
+         * Port the standalone worker's health endpoint binds to. Defaults to
+         * PORT+1 so the API and worker can run side by side on one machine.
+         * Platforms that require a service to bind their injected $PORT (Render
+         * web services) need this set to the same value as PORT.
+         */
+        WORKER_PORT: optionalNumeric(),
         NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
         LOG_LEVEL: z
             .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
@@ -106,6 +127,7 @@ const envSchema = z
     .transform((e) => ({
         ...e,
         REDIS_URL: e.REDIS_URL ?? e.UPSTASH_REDIS_URL ?? '',
+        WORKER_PORT: e.WORKER_PORT ?? e.PORT + 1,
         LINK_SECRET: e.LINK_SECRET ?? e.JWT_SECRET,
         /** Every origin permitted by CORS. */
         CORS_ORIGINS: [e.FRONTEND_URL, ...e.ALLOWED_ORIGINS].filter(Boolean),

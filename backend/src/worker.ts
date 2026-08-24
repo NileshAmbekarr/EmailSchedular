@@ -31,7 +31,9 @@ const start = async (): Promise<void> => {
     timers.push(startDueCampaignSweeper(), startRecoverySweeper());
 
     // Most platforms require a listening port to consider a service healthy.
-    const port = env.PORT + 1;
+    // Render web services in particular fail the deploy outright if nothing
+    // binds their injected $PORT — set WORKER_PORT equal to PORT there.
+    const port = env.WORKER_PORT;
     http
         .createServer(async (req, res) => {
             if (req.url === '/ready') {

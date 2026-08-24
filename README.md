@@ -180,6 +180,10 @@ RUN_WORKER_IN_API=false npm start
 npm run start:worker
 ```
 
+On Render this needs a paid plan — Background Workers are not free. The blueprint
+therefore defaults to a single free service with the workers in-process, and
+carries a commented block for the split. See [Deploying to Render](#deploying-to-render).
+
 Large campaigns are expanded by a paged fan-out job (`FANOUT_BATCH_SIZE`), so
 scheduling 100k recipients returns immediately instead of holding a request open
 for 300k round trips.
@@ -203,6 +207,66 @@ npm run dev
 
 Migrations live in `backend/drizzle/` and are committed. CI fails if the schema
 changes without one. Do not use `db:push` against a database with real data.
+
+---
+
+## Deploying to Render
+
+Easiest path is the blueprint: **New → Blueprint** and pick this repo.
+[`render.yaml`](render.yaml) creates the service from the Docker image,
+generates `JWT_SECRET` / `ENCRYPTION_KEY` / `LINK_SECRET`, and runs migrations
+as a pre-deploy step.
+
+### Free tier
+
+Render's Background Workers are **paid-only**, so the blueprint ships a
+single-service layout with `RUN_WORKER_IN_API=true` — the queue workers run
+inside the API process.
+
+The catch: free web services spin down after ~15 minutes idle, and a sleeping
+service processes no jobs. A campaign scheduled for 03:00 will not send at 03:00
+unless something woke the instance. Two mitigations, both included:
+
+- `recoverOrphanedJobs()` runs on boot, so messages whose slot passed while the
+  service slept are re-enqueued and sent late rather than lost — up to
+  `MAX_RECOVERY_LATENESS_MS` (24h default), past which they are expired instead.
+- [`.github/workflows/keepalive.yml`](.github/workflows/keepalive.yml) pings
+  `/health` every 10 minutes. Set the repo **variable** `API_URL` to your Render
+  URL to activate it. Free tier gives 750 instance-hours/month against a ~730
+  hour month, so one always-on service fits.
+
+Accurate to-the-minute scheduling needs a paid instance. The commented block at
+the bottom of `render.yaml` splits the worker out; set `RUN_WORKER_IN_API=false`
+on the API when you do.
+
+Wiring it by hand instead? Render sets `NODE_ENV=production` on the build
+environment, and npm **skips devDependencies** when that is set — so
+`typescript` never installs and `tsc` falls through to whatever global version
+the build image ships (which is how a TS 7 `baseUrl has been removed` error
+appears in a project pinned to TS 5). Force a full install:
+
+**API service** — root directory `backend`:
+
+```bash
+npm ci --include=dev && npm run build && npm run migrate:deploy
+```
+
+Start command `node dist/index.js`, health check path `/ready`.
+
+**Worker service** — root directory `backend`, same build without the migrate:
+
+```bash
+npm ci --include=dev && npm run build
+```
+
+Start command `node dist/worker.js`.
+
+Use `migrate:deploy` (compiled) rather than `db:migrate`, which runs through
+`tsx` — a dev dependency that is absent from a production install and from the
+Docker runtime image.
+
+`ENCRYPTION_KEY` **must be identical** on both services: the worker decrypts
+stored SMTP credentials with it, and a mismatch fails every send.
 
 ---
 
