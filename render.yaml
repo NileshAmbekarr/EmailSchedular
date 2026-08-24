@@ -19,7 +19,9 @@
 #      month is ~730 hours, so one always-on service fits.
 #
 # For real scheduling accuracy, upgrade to a paid instance and split the worker
-# out — see the commented block at the bottom.
+# out — see the commented block at the bottom. On a paid plan you can also move
+# migrations back to `preDeployCommand: node dist/db/migrate.js`, which runs
+# before the new version receives traffic instead of at container start.
 
 services:
   - type: web
@@ -29,10 +31,15 @@ services:
     region: singapore
     dockerfilePath: ./backend/Dockerfile
     dockerContext: ./backend
-    dockerCommand: node dist/index.js
-
-    # Applied before the new version receives traffic.
-    preDeployCommand: node dist/db/migrate.js
+    # Free services do not support preDeployCommand, so migrations run at
+    # container start. Drizzle checks its ledger first, so repeated runs are
+    # no-ops, and a failed migration correctly prevents the server starting.
+    #
+    # `exec` matters: without it `sh` stays PID 1's child and swallows SIGTERM,
+    # so node never runs its graceful-shutdown handler and in-flight sends are
+    # killed on every deploy. With exec, node replaces sh in the same process
+    # and dumb-init signals it directly.
+    dockerCommand: sh -c "node dist/db/migrate.js && exec node dist/index.js"
 
     healthCheckPath: /ready
 

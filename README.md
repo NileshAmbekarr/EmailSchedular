@@ -214,8 +214,9 @@ changes without one. Do not use `db:push` against a database with real data.
 
 Easiest path is the blueprint: **New → Blueprint** and pick this repo.
 [`render.yaml`](render.yaml) creates the service from the Docker image,
-generates `JWT_SECRET` / `ENCRYPTION_KEY` / `LINK_SECRET`, and runs migrations
-as a pre-deploy step.
+generates `JWT_SECRET` / `ENCRYPTION_KEY` / `LINK_SECRET`, and applies
+migrations at container start (free services do not support
+`preDeployCommand`; on a paid plan, move it there instead).
 
 ### Free tier
 
