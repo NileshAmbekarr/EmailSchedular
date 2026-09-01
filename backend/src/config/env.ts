@@ -130,7 +130,22 @@ const envSchema = z
         WORKER_PORT: e.WORKER_PORT ?? e.PORT + 1,
         LINK_SECRET: e.LINK_SECRET ?? e.JWT_SECRET,
         /** Every origin permitted by CORS. */
-        CORS_ORIGINS: [e.FRONTEND_URL, ...e.ALLOWED_ORIGINS].filter(Boolean),
+        /**
+         * Browsers send `Origin` with no trailing slash and no path, so a
+         * configured value like `https://app.vercel.app/` would never match and
+         * every request would be blocked. Normalise to scheme://host[:port].
+         */
+        CORS_ORIGINS: [e.FRONTEND_URL, ...e.ALLOWED_ORIGINS]
+            .filter(Boolean)
+            .map((value) => {
+                try {
+                    return new URL(value).origin;
+                } catch {
+                    // Not a URL (bad config) — strip trailing slashes and let
+                    // the comparison fail loudly rather than throwing at boot.
+                    return value.replace(/\/+$/, '');
+                }
+            }),
         IS_PROD: e.NODE_ENV === 'production',
         IS_TEST: e.NODE_ENV === 'test',
     }))

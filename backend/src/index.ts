@@ -4,6 +4,7 @@ import type { Worker } from 'bullmq';
 import { createApp } from './app.js';
 import { env } from './config/env.js';
 import { logger } from './config/logger.js';
+import { installRejectionHandlers } from './config/rejections.js';
 import { closeDatabase } from './config/database.js';
 import { closeRedis } from './config/redis.js';
 import { closeQueues } from './queues/queues.js';
@@ -96,9 +97,7 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.on(signal, () => void shutdown(signal));
 }
 
-process.on('unhandledRejection', (reason) => {
-    logger.error({ reason }, 'unhandled promise rejection');
-});
+installRejectionHandlers(logger);
 
 process.on('uncaughtException', (err) => {
     logger.fatal({ err }, 'uncaught exception, shutting down');

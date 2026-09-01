@@ -3,6 +3,7 @@ import http from 'node:http';
 import type { Worker } from 'bullmq';
 import { env } from './config/env.js';
 import { logger } from './config/logger.js';
+import { installRejectionHandlers } from './config/rejections.js';
 import { closeDatabase, pingDatabase } from './config/database.js';
 import { closeRedis, pingRedis } from './config/redis.js';
 import { closeQueues } from './queues/queues.js';
@@ -75,7 +76,7 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.on(signal, () => void shutdown(signal));
 }
 
-process.on('unhandledRejection', (reason) => logger.error({ reason }, 'unhandled rejection'));
+installRejectionHandlers(logger);
 
 start().catch((err) => {
     logger.fatal({ err }, 'worker failed to start');

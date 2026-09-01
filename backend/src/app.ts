@@ -46,8 +46,16 @@ export const createApp = (): Express => {
                 return id;
             },
             // Tracking pixels are high-volume and uninteresting.
+            // Tracking pixels are high-volume, and platform health checks run
+            // every few seconds — logging either buries the requests that
+            // actually matter. Failures still surface via customLogLevel.
             autoLogging: {
-                ignore: (req) => req.url?.startsWith('/api/public/open/') ?? false,
+                ignore: (req) => {
+                    const url = req.url ?? '';
+                    if (url.startsWith('/api/public/open/')) return true;
+                    if (url === '/health' || url === '/ready') return true;
+                    return false;
+                },
             },
             customLogLevel: (_req, res, err) => {
                 if (err || res.statusCode >= 500) return 'error';
