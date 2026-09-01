@@ -31,15 +31,11 @@ services:
     region: singapore
     dockerfilePath: ./backend/Dockerfile
     dockerContext: ./backend
-    # Free services do not support preDeployCommand, so migrations run at
-    # container start. Drizzle checks its ledger first, so repeated runs are
-    # no-ops, and a failed migration correctly prevents the server starting.
-    #
-    # `exec` matters: without it `sh` stays PID 1's child and swallows SIGTERM,
-    # so node never runs its graceful-shutdown handler and in-flight sends are
-    # killed on every deploy. With exec, node replaces sh in the same process
-    # and dumb-init signals it directly.
-    dockerCommand: sh -c "node dist/db/migrate.js && exec node dist/index.js"
+    # Plain argv only — Render's command parsing mangles quoted shell strings
+    # like `sh -c "a && b"` (it passes the whole thing as the command name).
+    # Migrations run in the image's entrypoint instead; see
+    # backend/docker-entrypoint.sh.
+    dockerCommand: node dist/index.js
 
     healthCheckPath: /ready
 
@@ -106,6 +102,10 @@ services:
 #    envVars:
 #      - key: NODE_ENV
 #        value: production
+#      # Only the API migrates; two services racing the same migration is how a
+#      # schema ends up half-applied.
+#      - key: RUN_MIGRATIONS
+#        value: "false"
 #      - key: WORKER_CONCURRENCY
 #        value: "5"
 #      - fromService:

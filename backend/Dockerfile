@@ -49,6 +49,11 @@ COPY --from=build --chown=app:app /app/package.json ./package.json
 # Migrations are applied by `node dist/db/migrate.js`, which reads these.
 COPY --chown=app:app drizzle ./drizzle
 
+# chmod here rather than relying on the git executable bit, which does not
+# survive a checkout on Windows.
+COPY --chown=app:app docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
 USER app
 EXPOSE 3001
 
@@ -57,5 +62,9 @@ EXPOSE 3001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
     CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3001)+'/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-ENTRYPOINT ["dumb-init", "--"]
+# The entrypoint applies migrations (unless RUN_MIGRATIONS=false) and then
+# execs the command below, so platform overrides stay simple argv with no shell
+# metacharacters — Render's command parsing does not handle a quoted
+# `sh -c "a && b"` string.
+ENTRYPOINT ["dumb-init", "--", "/app/docker-entrypoint.sh"]
 CMD ["node", "dist/index.js"]

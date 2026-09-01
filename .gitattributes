@@ -1,0 +1,7 @@
+# Shell scripts must keep LF. A CRLF shebang makes the kernel look for an
+# interpreter literally named "/bin/sh\r", which surfaces in containers as a
+# confusing "not found" error.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
